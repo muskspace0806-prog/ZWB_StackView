@@ -349,20 +349,22 @@ class ZWBTagContainerView: UIView {
 
         let space    = config.marqueeItemSpacing
         let groupCnt = items.count
+        guard groupCnt > 0 else { return }
+
+        let sizes = marqueeOriginalViews.map { naturalSize(of: $0) }
+        let rowH = sizes.map { $0.height }.max() ?? config.imageHeight
+        let total = config.contentInset.top + rowH + config.contentInset.bottom
+        updateIntrinsicHeight(total)
+
         var x: CGFloat = 0
 
         for (i, view) in marqueeAllViews.enumerated() {
             let localIndex = i % groupCnt
-            let size = naturalSize(of: marqueeOriginalViews[localIndex])
-            let y = (bounds.height - size.height) / 2
+            let size = sizes[localIndex]
+            let y = config.contentInset.top + (rowH - size.height) / 2
             view.frame = CGRect(x: x, y: y, width: size.width, height: size.height)
             x += size.width + space
         }
-
-        // 更新容器高度（单行）
-        let rowH = marqueeOriginalViews.map { naturalSize(of: $0).height }.max() ?? config.imageHeight
-        let total = config.contentInset.top + rowH + config.contentInset.bottom
-        updateIntrinsicHeight(total)
 
         if !hasAdjustedInitialPosition {
             // 初始偏移：从容器右边界开始滚入，参考 GMMarqueeView adjustInitialPosition
