@@ -55,6 +55,14 @@ class ViewController: UIViewController {
         last = addSection("⑧ 图文混合（右图左字）· 居中",    items: mixedItems(layout: .imageRight), alignment: .center, below: last)
         last = addSection("⑨ 全类型混排 · 右对齐",          items: allItems(),                      alignment: .right,  below: last)
 
+        // ── 轮播演示 ──────────────────────────────────────────
+        // 超过 4 个自动轮播，speed 60，item 间距 24
+        last = addSection("⑩ 轮播跑马灯（超过4个自动滚动）",
+                          items: marqueeItems(),
+                          alignment: .left,
+                          marqueeThreshold: 4,
+                          below: last)
+
         // 最后一个 section 底部到 contentView 底部
         contentView.snp.makeConstraints { make in
             make.bottom.equalTo(last).offset(24)
@@ -68,6 +76,7 @@ class ViewController: UIViewController {
         _ title: String,
         items: [ZWBTagItem],
         alignment: ZWBAlignment,
+        marqueeThreshold: Int = 0,
         below anchor: ConstraintRelatableTarget
     ) -> ConstraintRelatableTarget {
 
@@ -99,11 +108,14 @@ class ViewController: UIViewController {
         // 标签容器
         let container = ZWBTagContainerView()
         var cfg = ZWBTagConfig()
-        cfg.alignment         = alignment
-        cfg.imageHeight       = 36
-        cfg.horizontalSpacing = 10
-        cfg.verticalSpacing   = 10
-        cfg.contentInset      = UIEdgeInsets(top: 12, left: 16, bottom: 12, right: 16)
+        cfg.alignment                  = alignment
+        cfg.imageHeight                = 36
+        cfg.horizontalSpacing          = 10
+        cfg.verticalSpacing            = 10
+        cfg.contentInset               = UIEdgeInsets(top: 12, left: 16, bottom: 12, right: 16)
+        cfg.marqueeItemCountThreshold  = marqueeThreshold
+        cfg.marqueeSpeed               = 60
+        cfg.marqueeItemSpacing         = 24
         container.update(items: items, config: cfg)
         container.backgroundColor    = UIColor.systemGray6
         container.layer.cornerRadius = 10
@@ -198,6 +210,31 @@ class ViewController: UIViewController {
     }
 
     // MARK: - 工具
+
+    /// 轮播 Demo 数据：文字 + 本地图 + 图文混合，共 8 个（超过阈值 4）
+    private func marqueeItems() -> [ZWBTagItem] {
+        let symbols = ["star.fill", "heart.fill", "bolt.fill", "flame.fill"]
+        let colors: [UIColor] = [.systemYellow, .systemRed, .systemBlue, .systemOrange]
+        var result: [ZWBTagItem] = []
+
+        result.append(.text("Swift"))
+        result.append(.text("UIKit"))
+
+        for (i, sym) in symbols.enumerated() {
+            let img = UIImage(systemName: sym)?.withTintColor(colors[i], renderingMode: .alwaysOriginal)
+            result.append(.image(source: .local(img!), tapHandler: { [weak self] in
+                self?.showAlert("轮播点击", "点击了 \(sym)")
+            }))
+        }
+
+        let person = UIImage(systemName: "person.fill")?.withTintColor(.systemPurple, renderingMode: .alwaysOriginal)
+        result.append(.mixed(source: .local(person!), text: "用户", layout: .imageLeft, spacing: 4, tapHandler: { [weak self] in
+            self?.showAlert("轮播点击", "点击了图文混合")
+        }))
+        result.append(.text("iOS 开发"))
+
+        return result
+    }
 
     private func showAlert(_ title: String, _ msg: String) {
         let ac = UIAlertController(title: title, message: msg, preferredStyle: .alert)

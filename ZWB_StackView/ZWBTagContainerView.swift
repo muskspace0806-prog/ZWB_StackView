@@ -9,12 +9,8 @@
 //    - 图片来源：本地 / 网络（Kingfisher）/ 本地优先网络兜底
 //    - 三种对齐：left / center / right
 //    - 数据不固定，自动换行
-//    - 适配 Cell 复用场景
-//
-//  布局说明：
-//    - 容器内子 item 的流式折行排列使用 frame 手动计算
-//      （子 view 数量动态、需要折行，AutoLayout 无法直接胜任）
-//    - item 内部子视图（imageView / label）使用 SnapKit 约束
+//    - 超出指定数量时自动切换为无限轮播跑马灯（参考 GMMarqueeView）
+//    - 适配 UITableViewCell / UICollectionViewCell 复用场景
 
 import UIKit
 import Kingfisher
@@ -23,11 +19,8 @@ import SnapKit
 // MARK: - 图片来源
 
 enum ZWBImageSource {
-    /// 纯本地图片
     case local(UIImage)
-    /// 纯网络图片，placeholder 可选
     case remote(url: URL, placeholder: UIImage?)
-    /// 本地优先：本地为 nil 时走网络
     case localOrRemote(local: UIImage?, url: URL, placeholder: UIImage?)
 }
 
@@ -40,18 +33,15 @@ enum ZWBAlignment {
 // MARK: - 图文混合方向
 
 enum ZWBImageTextLayout {
-    case imageLeft    // 图左文右
-    case imageRight   // 图右文左
+    case imageLeft
+    case imageRight
 }
 
 // MARK: - Item 数据模型
 
 enum ZWBTagItem {
-    /// 纯文字
     case text(String)
-    /// 纯图片，高度固定宽度自适应，可点击
     case image(source: ZWBImageSource, tapHandler: (() -> Void)?)
-    /// 图文混合，整体可点击
     case mixed(
         source: ZWBImageSource,
         text: String,
@@ -61,9 +51,10 @@ enum ZWBTagItem {
     )
 }
 
-// MARK: - 配置（批量设置避免多次 reload）
+// MARK: - 配置
 
 struct ZWBTagConfig {
+    // ── 静态布局 ──────────────────────────────────────────────
     var horizontalSpacing: CGFloat    = 8
     var verticalSpacing: CGFloat      = 8
     var contentInset: UIEdgeInsets    = UIEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
@@ -77,6 +68,14 @@ struct ZWBTagConfig {
     var itemCornerRadius: CGFloat     = 6
     var alignment: ZWBAlignment       = .left
 
+    // ── 跑马灯 ────────────────────────────────────────────────
+    /// 超过多少个 item 时触发自动轮播；0 = 永不触发（默认关闭）
+    var marqueeItemCountThreshold: Int = 0
+    /// 滚动速度，单位 pt/s，默认 50
+    var marqueeSpeed: CGFloat          = 50
+    /// item 之间的间距（轮播模式下使用，与 horizontalSpacing 独立）
+    var marqueeItemSpacing: CGFloat    = 20
+
     static let `default` = ZWBTagConfig()
 }
 
@@ -84,49 +83,81 @@ struct ZWBTagConfig {
 
 class ZWBTagContainerView: UIView {
 
-    // MARK: 私有属性
+    // MARK: 私有 — 通用
 
     private var items: [ZWBTagItem] = []
-    private var itemViews: [UIView] = []
     private var config: ZWBTagConfig = .default
 
     private var needsRebuild: Bool = false
     private var cachedLayoutWidth: CGFloat = 0
     private var _intrinsicHeight: CGFloat = 0
 
+    // MARK: 私有 — 静态布局
+
+    private var staticItemViews: [UIView] = []
+
+    // MARK: 私有 — 轮播模式（参考 GMMarqueeView）
+
+    /// 轮播模式下所有复制的 view（6 组）
+    private var marqueeAllViews: [UIView] = []
+    /// 单组原始 item 视图（用于点击索引对应）
+    private var marqueeOriginalViews: [UIView] = []
+    /// 单组内容宽度（不含末尾间距）
+    private var singleContentWidth: CGFloat = 0
+    /// 单组完整宽度（含末尾间距，用于无缝重置）
+    private var singleGroupWidth: CGFloat = 0
+    /// 当前整体偏移（用于校准）
+    private var marqueeOffsetX: CGFloat = 0
+    /// CADisplayLink
+    private var displayLink: CADisplayLink?
+    /// 防重入
+    private var isUpdatingMarquee: Bool = false
+    private var isTickingMarquee: Bool = false
+    private var isLayingOutMarquee: Bool = false
+    private var hasAdjustedInitialPosition: Bool = false
+
     // MARK: 初始化
 
-    override init(frame: CGRect) { super.init(frame: frame) }
-    required init?(coder: NSCoder) { super.init(coder: coder) }
+    override init(frame: CGRect) { super.init(frame: frame); clipsToBounds = true }
+    required init?(coder: NSCoder) { super.init(coder: coder); clipsToBounds = true }
 
     // MARK: 公开 API
 
-    /// 批量更新配置 + 数据，只触发一次 reload（推荐 cell 里使用）
     func update(items: [ZWBTagItem], config: ZWBTagConfig = .default) {
         self.config = config
         self.items  = items
         scheduleRebuild()
     }
 
-    /// 仅更新数据
     func setItems(_ items: [ZWBTagItem]) {
         self.items = items
         scheduleRebuild()
     }
 
-    /// 仅更新配置
     func setConfig(_ config: ZWBTagConfig) {
         self.config = config
         scheduleRebuild()
     }
 
-    /// Cell prepareForReuse 时调用，取消网络请求并清空视图
+    /// Cell prepareForReuse 时调用
     func reset() {
-        cancelAllDownloads()
+        stopMarquee()
+        cancelAllDownloads(in: staticItemViews)
+        cancelAllDownloads(in: marqueeAllViews)
+        staticItemViews.forEach { $0.removeFromSuperview() }
+        marqueeAllViews.forEach { $0.removeFromSuperview() }
+        staticItemViews.removeAll()
+        marqueeAllViews.removeAll()
+        marqueeOriginalViews.removeAll()
         items = []
-        itemViews.forEach { $0.removeFromSuperview() }
-        itemViews = []
         needsRebuild = false
+        isUpdatingMarquee = false
+        isTickingMarquee = false
+        isLayingOutMarquee = false
+        hasAdjustedInitialPosition = false
+        singleContentWidth = 0
+        singleGroupWidth = 0
+        marqueeOffsetX = 0
         cachedLayoutWidth = 0
         _intrinsicHeight = 0
         invalidateIntrinsicContentSize()
@@ -143,7 +174,28 @@ class ZWBTagContainerView: UIView {
         if needsRebuild { rebuildViews() }
         guard bounds.width > 0, bounds.width != cachedLayoutWidth else { return }
         cachedLayoutWidth = bounds.width
-        layoutItems()
+
+        if isMarqueeMode {
+            layoutMarqueeItems()
+        } else {
+            layoutStaticItems()
+        }
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil {
+            stopMarquee()
+        } else if isMarqueeMode, !isUpdatingMarquee, !marqueeAllViews.isEmpty {
+            startMarquee()
+        }
+    }
+
+    // MARK: 判断是否轮播模式
+
+    private var isMarqueeMode: Bool {
+        let threshold = config.marqueeItemCountThreshold
+        return threshold > 0 && items.count > threshold
     }
 
     // MARK: 调度
@@ -151,209 +203,63 @@ class ZWBTagContainerView: UIView {
     private func scheduleRebuild() {
         needsRebuild = true
         cachedLayoutWidth = 0
+        stopMarquee()
         setNeedsLayout()
     }
 
-    // MARK: 视图重建
+    // MARK: 重建视图
 
     private func rebuildViews() {
         needsRebuild = false
-        cancelAllDownloads()
-        itemViews.forEach { $0.removeFromSuperview() }
-        itemViews = []
+        isUpdatingMarquee = true
+
+        // 清理旧视图
+        stopMarquee()
+        cancelAllDownloads(in: staticItemViews)
+        cancelAllDownloads(in: marqueeAllViews)
+        staticItemViews.forEach { $0.removeFromSuperview() }
+        marqueeAllViews.forEach { $0.removeFromSuperview() }
+        staticItemViews.removeAll()
+        marqueeAllViews.removeAll()
+        marqueeOriginalViews.removeAll()
+        hasAdjustedInitialPosition = false
+        singleContentWidth = 0
+        singleGroupWidth = 0
+        marqueeOffsetX = 0
+
+        if isMarqueeMode {
+            buildMarqueeViews()
+        } else {
+            buildStaticViews()
+        }
+
+        // 异步收尾，确保布局完成后再启动
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.isUpdatingMarquee = false
+            if self.isMarqueeMode, self.window != nil {
+                self.startMarquee()
+            }
+        }
+    }
+
+    // MARK: ── 静态模式 ──────────────────────────────────────────
+
+    private func buildStaticViews() {
         for item in items {
             let v = makeView(for: item)
             addSubview(v)
-            itemViews.append(v)
+            staticItemViews.append(v)
         }
     }
 
-    private func cancelAllDownloads() {
-        itemViews.forEach { wrapper in
-            wrapper.subviews.compactMap { $0 as? UIImageView }.forEach {
-                $0.kf.cancelDownloadTask()
-            }
-        }
-    }
-
-    // MARK: 视图工厂
-
-    private func makeView(for item: ZWBTagItem) -> UIView {
-        switch item {
-        case .text(let str):
-            return makeTextView(text: str)
-        case .image(let source, let handler):
-            return makeImageOnlyView(source: source, tapHandler: handler)
-        case .mixed(let source, let text, let layout, let spacing, let handler):
-            return makeMixedView(source: source, text: text, layout: layout, spacing: spacing, tapHandler: handler)
-        }
-    }
-
-    // MARK: 纯文字 item
-    // 内部用 SnapKit 约束 label 内容，外层 frame 由流式算法决定
-
-    private func makeTextView(text: String) -> UIView {
-        let label = PaddedLabel(insets: config.textInset)
-        label.text = text
-        label.font = config.textFont
-        label.textColor = config.textColor
-        label.backgroundColor = config.textBackgroundColor
-        label.layer.cornerRadius = config.itemCornerRadius
-        label.layer.masksToBounds = true
-        // PaddedLabel 通过 intrinsicContentSize 给出尺寸，流式算法读取后设置 frame
-        return label
-    }
-
-    // MARK: 纯图片 item
-    // wrapper.frame 由流式算法设置；imageView 用 SnapKit 填满 wrapper
-
-    private func makeImageOnlyView(source: ZWBImageSource, tapHandler: (() -> Void)?) -> UIView {
-        let wrapper = TappableView()
-        wrapper.tapHandler = tapHandler
-        wrapper.layer.cornerRadius = config.itemCornerRadius
-        wrapper.layer.masksToBounds = true
-
-        let imageView = UIImageView()
-        imageView.contentMode = .scaleAspectFit
-        wrapper.addSubview(imageView)
-
-        // SnapKit：imageView 填满 wrapper
-        imageView.snp.makeConstraints { make in
-            make.edges.equalToSuperview()
-        }
-
-        // 用 placeholder 先定 wrapper 尺寸
-        let ph = placeholder(for: source)
-        let initW = calcImageWidth(for: ph)
-        wrapper.frame = CGRect(x: 0, y: 0, width: initW, height: config.imageHeight)
-
-        loadImage(source: source, into: imageView) { [weak self, weak wrapper] img in
-            guard let self, let wrapper else { return }
-            let newW = self.calcImageWidth(for: img)
-            wrapper.frame = CGRect(x: wrapper.frame.origin.x,
-                                   y: wrapper.frame.origin.y,
-                                   width: newW,
-                                   height: self.config.imageHeight)
-            self.cachedLayoutWidth = 0
-            self.setNeedsLayout()
-        }
-
-        return wrapper
-    }
-
-    // MARK: 图文混合 item
-    // wrapper.frame 由流式算法设置；内部 imageView / label 用 SnapKit 约束
-
-    private func makeMixedView(
-        source: ZWBImageSource,
-        text: String,
-        layout: ZWBImageTextLayout,
-        spacing: CGFloat,
-        tapHandler: (() -> Void)?
-    ) -> UIView {
-
-        let wrapper = TappableView()
-        wrapper.tapHandler = tapHandler
-        wrapper.backgroundColor = config.mixedBackgroundColor
-        wrapper.layer.cornerRadius = config.itemCornerRadius
-        wrapper.layer.masksToBounds = true
-
-        let imageView = UIImageView()
-        imageView.contentMode = .scaleAspectFit
-        imageView.layer.cornerRadius = 2
-        imageView.layer.masksToBounds = true
-
-        let label = UILabel()
-        label.text = text
-        label.font = config.textFont
-        label.textColor = config.textColor
-        label.numberOfLines = 1
-
-        wrapper.addSubview(imageView)
-        wrapper.addSubview(label)
-
-        // 用 placeholder 先布局
-        let ph = placeholder(for: source)
-        let initImgW = calcImageWidth(for: ph)
-        applyMixedConstraints(
-            wrapper: wrapper, imageView: imageView, label: label,
-            imgWidth: initImgW, layout: layout, spacing: spacing
-        )
-
-        loadImage(source: source, into: imageView) { [weak self, weak wrapper, weak imageView, weak label] img in
-            guard let self, let wrapper, let imageView, let label else { return }
-            let newImgW = self.calcImageWidth(for: img)
-            self.applyMixedConstraints(
-                wrapper: wrapper, imageView: imageView, label: label,
-                imgWidth: newImgW, layout: layout, spacing: spacing
-            )
-            self.cachedLayoutWidth = 0
-            self.setNeedsLayout()
-        }
-
-        return wrapper
-    }
-
-    /// 用 SnapKit 设置混合 item 内部约束，图片宽度确定后可重复调用更新
-    private func applyMixedConstraints(
-        wrapper: UIView,
-        imageView: UIImageView,
-        label: UILabel,
-        imgWidth: CGFloat,
-        layout: ZWBImageTextLayout,
-        spacing: CGFloat
-    ) {
-        let il = config.mixedInset.left
-        let ir = config.mixedInset.right
-        let it = config.mixedInset.top
-        let ib = config.mixedInset.bottom
-        let ih = config.imageHeight
-        let labelSize = label.sizeThatFits(CGSize(width: .greatestFiniteMagnitude, height: ih))
-        let totalW = il + imgWidth + spacing + labelSize.width + ir
-        let totalH = it + max(ih, labelSize.height) + ib
-
-        // 先移除旧约束再重设
-        imageView.snp.remakeConstraints { make in
-            make.width.equalTo(imgWidth)
-            make.height.equalTo(ih)
-            make.centerY.equalToSuperview()
-            switch layout {
-            case .imageLeft:  make.leading.equalToSuperview().offset(il)
-            case .imageRight: make.trailing.equalToSuperview().offset(-ir)
-            }
-        }
-
-        label.snp.remakeConstraints { make in
-            make.centerY.equalToSuperview()
-            make.width.equalTo(labelSize.width)
-            switch layout {
-            case .imageLeft:
-                make.leading.equalTo(imageView.snp.trailing).offset(spacing)
-            case .imageRight:
-                make.leading.equalToSuperview().offset(il)
-            }
-        }
-
-        // wrapper 的 frame 由流式算法控制，这里只更新尺寸部分
-        wrapper.frame = CGRect(
-            x: wrapper.frame.origin.x,
-            y: wrapper.frame.origin.y,
-            width: totalW,
-            height: totalH
-        )
-    }
-
-    // MARK: 流式排列（frame 计算）
-
-    private func layoutItems() {
+    private func layoutStaticItems() {
         let maxW = bounds.width - config.contentInset.left - config.contentInset.right
-
-        // 第一步：按行分组
         var rows: [[(view: UIView, size: CGSize)]] = []
         var currentRow: [(view: UIView, size: CGSize)] = []
         var currentRowW: CGFloat = 0
 
-        for view in itemViews {
+        for view in staticItemViews {
             let size = naturalSize(of: view)
             if currentRow.isEmpty {
                 currentRow.append((view, size))
@@ -372,7 +278,6 @@ class ZWBTagContainerView: UIView {
         }
         if !currentRow.isEmpty { rows.append(currentRow) }
 
-        // 第二步：逐行计算 frame
         var offsetY = config.contentInset.top
         for row in rows {
             let rowW = row.reduce(0) { $0 + $1.size.width }
@@ -399,64 +304,300 @@ class ZWBTagContainerView: UIView {
             offsetY += rowH + config.verticalSpacing
         }
 
-        // 更新容器高度
         let total = rows.isEmpty
             ? config.contentInset.top + config.contentInset.bottom
             : offsetY - config.verticalSpacing + config.contentInset.bottom
 
-        if _intrinsicHeight != total {
-            _intrinsicHeight = total
-            invalidateIntrinsicContentSize()
-            superview?.setNeedsLayout()
+        updateIntrinsicHeight(total)
+    }
+
+    // MARK: ── 轮播模式（参考 GMMarqueeView）─────────────────────
+
+    private func buildMarqueeViews() {
+        // 先构建一组原始 views，计算单组宽度
+        var originals: [UIView] = []
+        for item in items {
+            let v = makeView(for: item)
+            originals.append(v)
+        }
+        marqueeOriginalViews = originals
+
+        // 单组宽度计算（所有 item 宽度之和 + 间距）
+        let space = config.marqueeItemSpacing
+        let sizes = originals.map { naturalSize(of: $0) }
+        let totalItemW = sizes.reduce(0) { $0 + $1.width }
+        singleContentWidth = totalItemW + space * CGFloat(max(originals.count - 1, 0))
+        singleGroupWidth   = singleContentWidth + space  // 末尾加一个间距，衔接下一组
+
+        // 复制 6 组，参考 GMMarqueeView，保证快速滚动不露底
+        for _ in 0..<6 {
+            for (index, original) in originals.enumerated() {
+                let copy = makeCopyView(of: original, originalIndex: index)
+                addSubview(copy)
+                marqueeAllViews.append(copy)
+            }
         }
     }
 
-    // MARK: 图片加载（Kingfisher 统一入口）
+    /// 轮播模式下初始布局（每次 layoutSubviews 且宽度变化时调用）
+    private func layoutMarqueeItems() {
+        guard !isLayingOutMarquee else { return }
+        isLayingOutMarquee = true
+        defer { isLayingOutMarquee = false }
 
-    private func loadImage(
+        guard !marqueeAllViews.isEmpty else { return }
+
+        let space    = config.marqueeItemSpacing
+        let groupCnt = items.count
+        var x: CGFloat = 0
+
+        for (i, view) in marqueeAllViews.enumerated() {
+            let localIndex = i % groupCnt
+            let size = naturalSize(of: marqueeOriginalViews[localIndex])
+            let y = (bounds.height - size.height) / 2
+            view.frame = CGRect(x: x, y: y, width: size.width, height: size.height)
+            x += size.width + space
+        }
+
+        // 更新容器高度（单行）
+        let rowH = marqueeOriginalViews.map { naturalSize(of: $0).height }.max() ?? config.imageHeight
+        let total = config.contentInset.top + rowH + config.contentInset.bottom
+        updateIntrinsicHeight(total)
+
+        if !hasAdjustedInitialPosition {
+            // 初始偏移：从容器右边界开始滚入，参考 GMMarqueeView adjustInitialPosition
+            let offset = bounds.width
+            marqueeAllViews.forEach { $0.frame.origin.x += offset }
+            marqueeOffsetX = -offset
+            hasAdjustedInitialPosition = true
+        }
+    }
+
+    /// 复制一个 view 用于轮播，保留点击能力
+    private func makeCopyView(of original: UIView, originalIndex: Int) -> UIView {
+        // 直接用 makeView 重新创建同类型视图（保留完整功能），
+        // 并绑定 tag 用于点击索引
+        let copy = makeView(for: items[originalIndex])
+        copy.tag = originalIndex
+        return copy
+    }
+
+    // MARK: ── CADisplayLink ──────────────────────────────────────
+
+    private func startMarquee() {
+        guard !isUpdatingMarquee, window != nil else { return }
+        stopMarquee()
+        let link = CADisplayLink(target: self, selector: #selector(tickMarquee))
+        link.add(to: .main, forMode: .common)
+        displayLink = link
+    }
+
+    private func stopMarquee() {
+        displayLink?.invalidate()
+        displayLink = nil
+    }
+
+    @objc private func tickMarquee() {
+        guard !isUpdatingMarquee,
+              !isLayingOutMarquee,
+              !isTickingMarquee,
+              !marqueeAllViews.isEmpty,
+              singleGroupWidth > 0 else { return }
+
+        isTickingMarquee = true
+        defer { isTickingMarquee = false }
+
+        // 每帧位移（speed pt/s ÷ 60fps）
+        let delta = config.marqueeSpeed / 60.0
+        marqueeOffsetX -= delta
+
+        for view in marqueeAllViews {
+            view.frame.origin.x -= delta
+        }
+
+        checkForwardLoop()
+    }
+
+    /// 向左滚动时：最左侧视图完全移出左边界超过一个 singleGroupWidth → 整体右移一组
+    private func checkForwardLoop() {
+        guard !isUpdatingMarquee, !isLayingOutMarquee,
+              !marqueeAllViews.isEmpty, singleGroupWidth > 0 else { return }
+
+        guard let leftmost = marqueeAllViews.min(by: { $0.frame.minX < $1.frame.minX }) else { return }
+
+        if leftmost.frame.maxX <= -singleGroupWidth {
+            for view in marqueeAllViews {
+                view.frame.origin.x += singleGroupWidth
+            }
+            marqueeOffsetX -= singleGroupWidth
+        }
+    }
+
+    // MARK: 工具 — 视图创建
+
+    private func makeView(for item: ZWBTagItem) -> UIView {
+        switch item {
+        case .text(let str):
+            return makeTextView(text: str)
+        case .image(let source, let handler):
+            return makeImageOnlyView(source: source, tapHandler: handler)
+        case .mixed(let source, let text, let layout, let spacing, let handler):
+            return makeMixedView(source: source, text: text, layout: layout, spacing: spacing, tapHandler: handler)
+        }
+    }
+
+    private func makeTextView(text: String) -> UIView {
+        let label = PaddedLabel(insets: config.textInset)
+        label.text = text
+        label.font = config.textFont
+        label.textColor = config.textColor
+        label.backgroundColor = config.textBackgroundColor
+        label.layer.cornerRadius = config.itemCornerRadius
+        label.layer.masksToBounds = true
+        return label
+    }
+
+    private func makeImageOnlyView(source: ZWBImageSource, tapHandler: (() -> Void)?) -> UIView {
+        let wrapper = TappableView()
+        wrapper.tapHandler = tapHandler
+        wrapper.layer.cornerRadius = config.itemCornerRadius
+        wrapper.layer.masksToBounds = true
+
+        let imageView = UIImageView()
+        imageView.contentMode = .scaleAspectFit
+        wrapper.addSubview(imageView)
+        imageView.snp.makeConstraints { $0.edges.equalToSuperview() }
+
+        let ph = placeholder(for: source)
+        let initW = calcImageWidth(for: ph)
+        wrapper.frame = CGRect(x: 0, y: 0, width: initW, height: config.imageHeight)
+
+        loadImage(source: source, into: imageView) { [weak self, weak wrapper] img in
+            guard let self, let wrapper else { return }
+            let newW = self.calcImageWidth(for: img)
+            wrapper.frame = CGRect(x: wrapper.frame.origin.x,
+                                   y: wrapper.frame.origin.y,
+                                   width: newW,
+                                   height: self.config.imageHeight)
+            self.cachedLayoutWidth = 0
+            self.setNeedsLayout()
+        }
+        return wrapper
+    }
+
+    private func makeMixedView(
         source: ZWBImageSource,
-        into imageView: UIImageView,
-        completion: ((UIImage?) -> Void)? = nil
+        text: String,
+        layout: ZWBImageTextLayout,
+        spacing: CGFloat,
+        tapHandler: (() -> Void)?
+    ) -> UIView {
+        let wrapper = TappableView()
+        wrapper.tapHandler = tapHandler
+        wrapper.backgroundColor = config.mixedBackgroundColor
+        wrapper.layer.cornerRadius = config.itemCornerRadius
+        wrapper.layer.masksToBounds = true
+
+        let imageView = UIImageView()
+        imageView.contentMode = .scaleAspectFit
+        imageView.layer.cornerRadius = 2
+        imageView.layer.masksToBounds = true
+
+        let label = UILabel()
+        label.text = text
+        label.font = config.textFont
+        label.textColor = config.textColor
+        label.numberOfLines = 1
+
+        wrapper.addSubview(imageView)
+        wrapper.addSubview(label)
+
+        let ph = placeholder(for: source)
+        applyMixedConstraints(wrapper: wrapper, imageView: imageView, label: label,
+                              imgWidth: calcImageWidth(for: ph), layout: layout, spacing: spacing)
+
+        loadImage(source: source, into: imageView) { [weak self, weak wrapper, weak imageView, weak label] img in
+            guard let self, let wrapper, let imageView, let label else { return }
+            self.applyMixedConstraints(wrapper: wrapper, imageView: imageView, label: label,
+                                       imgWidth: self.calcImageWidth(for: img), layout: layout, spacing: spacing)
+            self.cachedLayoutWidth = 0
+            self.setNeedsLayout()
+        }
+        return wrapper
+    }
+
+    private func applyMixedConstraints(
+        wrapper: UIView, imageView: UIImageView, label: UILabel,
+        imgWidth: CGFloat, layout: ZWBImageTextLayout, spacing: CGFloat
     ) {
+        let il = config.mixedInset.left,  ir = config.mixedInset.right
+        let it = config.mixedInset.top,   ib = config.mixedInset.bottom
+        let ih = config.imageHeight
+        let labelSize = label.sizeThatFits(CGSize(width: .greatestFiniteMagnitude, height: ih))
+
+        imageView.snp.remakeConstraints { make in
+            make.width.equalTo(imgWidth)
+            make.height.equalTo(ih)
+            make.centerY.equalToSuperview()
+            switch layout {
+            case .imageLeft:  make.leading.equalToSuperview().offset(il)
+            case .imageRight: make.trailing.equalToSuperview().offset(-ir)
+            }
+        }
+        label.snp.remakeConstraints { make in
+            make.centerY.equalToSuperview()
+            make.width.equalTo(labelSize.width)
+            switch layout {
+            case .imageLeft:  make.leading.equalTo(imageView.snp.trailing).offset(spacing)
+            case .imageRight: make.leading.equalToSuperview().offset(il)
+            }
+        }
+        wrapper.frame = CGRect(
+            x: wrapper.frame.origin.x, y: wrapper.frame.origin.y,
+            width: il + imgWidth + spacing + labelSize.width + ir,
+            height: it + max(ih, labelSize.height) + ib
+        )
+    }
+
+    // MARK: 工具 — 图片加载
+
+    private func loadImage(source: ZWBImageSource, into imageView: UIImageView, completion: ((UIImage?) -> Void)? = nil) {
         switch source {
         case .local(let img):
             imageView.image = img
             completion?(img)
-
         case .remote(let url, let ph):
             imageView.image = ph
-            imageView.kf.setImage(
-                with: url,
-                placeholder: ph,
-                options: [.transition(.fade(0.2)), .cacheOriginalImage]
-            ) { result in
-                completion?(try? result.get().image)
+            imageView.kf.setImage(with: url, placeholder: ph,
+                                  options: [.transition(.fade(0.2)), .cacheOriginalImage]) {
+                completion?(try? $0.get().image)
             }
-
         case .localOrRemote(let local, let url, let ph):
             if let local {
-                imageView.image = local
-                completion?(local)
+                imageView.image = local; completion?(local)
             } else {
                 imageView.image = ph
-                imageView.kf.setImage(
-                    with: url,
-                    placeholder: ph,
-                    options: [.transition(.fade(0.2)), .cacheOriginalImage]
-                ) { result in
-                    completion?(try? result.get().image)
+                imageView.kf.setImage(with: url, placeholder: ph,
+                                      options: [.transition(.fade(0.2)), .cacheOriginalImage]) {
+                    completion?(try? $0.get().image)
                 }
             }
         }
     }
 
-    // MARK: 工具
+    // MARK: 工具 — 通用
+
+    private func cancelAllDownloads(in views: [UIView]) {
+        views.forEach { wrapper in
+            wrapper.subviews.compactMap { $0 as? UIImageView }.forEach { $0.kf.cancelDownloadTask() }
+        }
+    }
 
     private func placeholder(for source: ZWBImageSource) -> UIImage? {
         switch source {
-        case .local(let img):                     return img
-        case .remote(_, let ph):                  return ph
-        case .localOrRemote(let l, _, let ph):    return l ?? ph
+        case .local(let img):                  return img
+        case .remote(_, let ph):               return ph
+        case .localOrRemote(let l, _, let ph): return l ?? ph
         }
     }
 
@@ -467,7 +608,15 @@ class ZWBTagContainerView: UIView {
 
     private func naturalSize(of view: UIView) -> CGSize {
         if let label = view as? PaddedLabel { return label.intrinsicContentSize }
-        return view.bounds.size   // TappableView 的 frame 已在创建时确定
+        return view.bounds.size
+    }
+
+    private func updateIntrinsicHeight(_ total: CGFloat) {
+        if _intrinsicHeight != total {
+            _intrinsicHeight = total
+            invalidateIntrinsicContentSize()
+            superview?.setNeedsLayout()
+        }
     }
 }
 
