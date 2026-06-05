@@ -15,8 +15,9 @@
 ## 依赖
 
 ```ruby
-pod 'Kingfisher', '~> 7.0'   # 网络图片加载
-pod 'SnapKit',    '~> 5.0'   # 内部子视图布局
+pod 'Kingfisher', '~> 7.0'              # 网络图片加载
+pod 'SnapKit',    '~> 5.0'              # 内部子视图布局
+pod 'ZWB_SwiftSVGAPlayer', '~> 1.0.3'   # SVGA 动画播放（svga item 类型）
 ```
 
 执行 `pod install` 后使用 `.xcworkspace` 打开项目。
@@ -46,6 +47,9 @@ pod 'SnapKit',    '~> 5.0'   # 内部子视图布局
 
 // 纯图片，可点击
 .image(source: ZWBImageSource, tapHandler: (() -> Void)?)
+
+// SVGA 动画，可点击（需 ZWB_SwiftSVGAPlayer）
+.svga(url: URL, tapHandler: (() -> Void)?)
 
 // 图文混合，整体可点击
 .mixed(
@@ -80,6 +84,12 @@ var textInset: UIEdgeInsets         // 文字 item 内边距
 var mixedInset: UIEdgeInsets        // 图文混合 item 内边距
 var itemCornerRadius: CGFloat       // item 圆角，默认 6
 var alignment: ZWBAlignment         // 对齐方式，默认 .left
+
+// ── 跑马灯（item 超出阈值时自动横向滚动）──
+var marqueeItemCountThreshold: Int  // 超过多少个 item 触发自动轮播，0=关闭（默认）
+var marqueeSpeed: CGFloat           // 滚动速度 pt/s，默认 50；正值向左，负值向右（阿语）
+var marqueeItemSpacing: CGFloat     // 轮播模式下 item 间距，默认 20
+var marqueeStartDelay: TimeInterval // 滚动启动前停顿时长(秒)，默认 1.5，避免加载即滚动的突兀
 ```
 
 ---
@@ -174,6 +184,43 @@ let items: [ZWBTagItem] = [
 ]
 container.setItems(items)
 ```
+
+---
+
+### SVGA 动画
+
+`svga` item 使用 [ZWB_SwiftSVGAPlayer](https://github.com/muskspace0806-prog/ZWB_SwiftSVGAPlayer) 播放在线/本地 SVGA，正方形显示（宽高等于 `config.imageHeight`），循环播放，复用时自动停止释放。
+
+```swift
+let url = URL(string: "https://example.com/medal.svga")!
+container.setItems([
+    .svga(url: url, tapHandler: { print("点击了 SVGA 勋章") }),
+])
+```
+
+---
+
+## 自动滚动（跑马灯）
+
+当 item 数量超过 `marqueeItemCountThreshold` 时，容器自动切换为无限横向轮播。内容从起点直接铺满（向左滚动从左边界、阿语向右滚动从右边界），启动前停顿 `marqueeStartDelay` 秒再滚动，避免页面加载即滚动的突兀感。
+
+```swift
+var config = ZWBTagConfig()
+config.imageHeight              = 32
+config.marqueeItemCountThreshold = 5      // 超过 5 个开始滚动
+config.marqueeSpeed             = 50      // 正值向左滚；阿语场景用 -50 向右滚
+config.marqueeItemSpacing       = 9
+config.marqueeStartDelay        = 1.5     // 停顿 1.5 秒再开始滚动
+
+container.update(items: items, config: config)
+```
+
+| 配置项 | 说明 |
+|--------|------|
+| `marqueeItemCountThreshold` | 超过多少个 item 触发滚动，0 关闭（默认） |
+| `marqueeSpeed` | 滚动速度 pt/s，正值向左 / 负值向右（阿语） |
+| `marqueeItemSpacing` | 轮播模式下 item 间距 |
+| `marqueeStartDelay` | 启动前停顿时长（秒），默认 1.5 |
 
 ---
 

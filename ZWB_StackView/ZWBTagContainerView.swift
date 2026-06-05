@@ -15,6 +15,7 @@
 import UIKit
 import Kingfisher
 import SnapKit
+import SwiftSVGAPlayer
 
 // MARK: - 图片来源
 
@@ -42,6 +43,8 @@ enum ZWBImageTextLayout {
 enum ZWBTagItem {
     case text(String)
     case image(source: ZWBImageSource, tapHandler: (() -> Void)?)
+    /// SVGA 动画标签（使用 ZWB_SwiftSVGAPlayer 播放）
+    case svga(url: URL, tapHandler: (() -> Void)?)
     case mixed(
         source: ZWBImageSource,
         text: String,
@@ -71,10 +74,12 @@ struct ZWBTagConfig {
     // ── 跑马灯 ────────────────────────────────────────────────
     /// 超过多少个 item 时触发自动轮播；0 = 永不触发（默认关闭）
     var marqueeItemCountThreshold: Int = 0
-    /// 滚动速度，单位 pt/s，默认 50
+    /// 滚动速度，单位 pt/s，默认 50；正值向左滚动，负值向右滚动（阿语场景）
     var marqueeSpeed: CGFloat          = 50
     /// item 之间的间距（轮播模式下使用，与 horizontalSpacing 独立）
     var marqueeItemSpacing: CGFloat    = 20
+    /// 滚动启动前的停顿时长（秒），页面加载出来后先静止再滚动，避免突兀；默认 1.5
+    var marqueeStartDelay: TimeInterval = 1.5
 
     static let `default` = ZWBTagConfig()
 }
@@ -115,6 +120,8 @@ class ZWBTagContainerView: UIView {
     private var isTickingMarquee: Bool = false
     private var isLayingOutMarquee: Bool = false
     private var hasAdjustedInitialPosition: Bool = false
+    /// 是否正在等待延迟启动滚动（避免重复调度）
+    private var isWaitingToStartMarquee: Bool = false
 
     // MARK: 初始化
 
@@ -144,6 +151,9 @@ class ZWBTagContainerView: UIView {
         stopMarquee()
         cancelAllDownloads(in: staticItemViews)
         cancelAllDownloads(in: marqueeAllViews)
+        // 停止所有 SVGA 播放器，避免内存泄漏
+        stopAllSVGA(in: staticItemViews)
+        stopAllSVGA(in: marqueeAllViews)
         staticItemViews.forEach { $0.removeFromSuperview() }
         marqueeAllViews.forEach { $0.removeFromSuperview() }
         staticItemViews.removeAll()
@@ -367,10 +377,15 @@ class ZWBTagContainerView: UIView {
         }
 
         if !hasAdjustedInitialPosition {
-            // 初始偏移：从容器右边界开始滚入，参考 GMMarqueeView adjustInitialPosition
-            let offset = bounds.width
-            marqueeAllViews.forEach { $0.frame.origin.x += offset }
-            marqueeOffsetX = -offset
+            if config.marqueeSpeed >= 0 {
+                // 向左滚动：初始内容直接从左边界开始铺满，立即滚动（不先推到屏幕外，避免开头一大段空白）
+                marqueeOffsetX = 0
+            } else {
+                // 向右滚动（阿语）：初始第一组内容右对齐到容器右边界，立即滚动
+                let offset = bounds.width - singleContentWidth
+                marqueeAllViews.forEach { $0.frame.origin.x += offset }
+                marqueeOffsetX = offset
+            }
             hasAdjustedInitialPosition = true
         }
     }
@@ -388,13 +403,25 @@ class ZWBTagContainerView: UIView {
 
     private func startMarquee() {
         guard !isUpdatingMarquee, window != nil else { return }
+        // 已在等待延迟启动，避免重复调度
+        guard !isWaitingToStartMarquee else { return }
         stopMarquee()
-        let link = CADisplayLink(target: self, selector: #selector(tickMarquee))
-        link.add(to: .main, forMode: .common)
-        displayLink = link
+        // 先停顿 config.marqueeStartDelay 秒再开始滚动，避免页面加载出来立即滚动的突兀感
+        isWaitingToStartMarquee = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + config.marqueeStartDelay) { [weak self] in
+            guard let self = self else { return }
+            self.isWaitingToStartMarquee = false
+            // 延迟期间状态可能已变化（被停止/不在窗口上），需重新校验
+            guard !self.isUpdatingMarquee, self.window != nil,
+                  !self.marqueeAllViews.isEmpty, self.displayLink == nil else { return }
+            let link = CADisplayLink(target: self, selector: #selector(self.tickMarquee))
+            link.add(to: .main, forMode: .common)
+            self.displayLink = link
+        }
     }
 
     private func stopMarquee() {
+        isWaitingToStartMarquee = false
         displayLink?.invalidate()
         displayLink = nil
     }
@@ -421,17 +448,29 @@ class ZWBTagContainerView: UIView {
     }
 
     /// 向左滚动时：最左侧视图完全移出左边界超过一个 singleGroupWidth → 整体右移一组
+    /// 向右滚动时：最右侧视图完全移出右边界超过一个 singleGroupWidth → 整体左移一组
     private func checkForwardLoop() {
         guard !isUpdatingMarquee, !isLayingOutMarquee,
               !marqueeAllViews.isEmpty, singleGroupWidth > 0 else { return }
 
-        guard let leftmost = marqueeAllViews.min(by: { $0.frame.minX < $1.frame.minX }) else { return }
-
-        if leftmost.frame.maxX <= -singleGroupWidth {
-            for view in marqueeAllViews {
-                view.frame.origin.x += singleGroupWidth
+        if config.marqueeSpeed >= 0 {
+            // 向左滚动：最左侧视图完全移出左边界
+            guard let leftmost = marqueeAllViews.min(by: { $0.frame.minX < $1.frame.minX }) else { return }
+            if leftmost.frame.maxX <= -singleGroupWidth {
+                for view in marqueeAllViews {
+                    view.frame.origin.x += singleGroupWidth
+                }
+                marqueeOffsetX -= singleGroupWidth
             }
-            marqueeOffsetX -= singleGroupWidth
+        } else {
+            // 向右滚动：最右侧视图完全移出右边界
+            guard let rightmost = marqueeAllViews.max(by: { $0.frame.maxX < $1.frame.maxX }) else { return }
+            if rightmost.frame.minX >= bounds.width + singleGroupWidth {
+                for view in marqueeAllViews {
+                    view.frame.origin.x -= singleGroupWidth
+                }
+                marqueeOffsetX += singleGroupWidth
+            }
         }
     }
 
@@ -443,6 +482,8 @@ class ZWBTagContainerView: UIView {
             return makeTextView(text: str)
         case .image(let source, let handler):
             return makeImageOnlyView(source: source, tapHandler: handler)
+        case .svga(let url, let handler):
+            return makeSVGAView(url: url, tapHandler: handler)
         case .mixed(let source, let text, let layout, let spacing, let handler):
             return makeMixedView(source: source, text: text, layout: layout, spacing: spacing, tapHandler: handler)
         }
@@ -457,6 +498,29 @@ class ZWBTagContainerView: UIView {
         label.layer.cornerRadius = config.itemCornerRadius
         label.layer.masksToBounds = true
         return label
+    }
+
+    /// 创建 SVGA 播放视图（正方形，宽高等于 imageHeight）
+    private func makeSVGAView(url: URL, tapHandler: (() -> Void)?) -> UIView {
+        let wrapper = TappableView()
+        wrapper.tapHandler = tapHandler
+        wrapper.layer.cornerRadius = config.itemCornerRadius
+        wrapper.layer.masksToBounds = true
+
+        let svgaView = SwiftSVGAPlayerView()
+        svgaView.clearsAfterStop = true
+        svgaView.contentMode = .scaleAspectFit
+        svgaView.backgroundColor = .clear
+        wrapper.addSubview(svgaView)
+        svgaView.snp.makeConstraints { $0.edges.equalToSuperview() }
+
+        // SVGA 标签固定正方形尺寸
+        let size = config.imageHeight
+        wrapper.frame = CGRect(x: 0, y: 0, width: size, height: size)
+
+        // 播放 SVGA 动画（循环播放）
+        svgaView.play(.url(url), loop: .forever)
+        return wrapper
     }
 
     private func makeImageOnlyView(source: ZWBImageSource, tapHandler: (() -> Void)?) -> UIView {
@@ -592,6 +656,16 @@ class ZWBTagContainerView: UIView {
     private func cancelAllDownloads(in views: [UIView]) {
         views.forEach { wrapper in
             wrapper.subviews.compactMap { $0 as? UIImageView }.forEach { $0.kf.cancelDownloadTask() }
+        }
+    }
+
+    /// 停止所有 SVGA 播放器动画，释放资源
+    private func stopAllSVGA(in views: [UIView]) {
+        views.forEach { wrapper in
+            wrapper.subviews.compactMap { $0 as? SwiftSVGAPlayerView }.forEach {
+                $0.stop()
+                $0.clear()
+            }
         }
     }
 
