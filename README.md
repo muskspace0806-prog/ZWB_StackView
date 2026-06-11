@@ -1,3 +1,7 @@
+<h3 align="left">
+  <strong>中文</strong> | <a href="./README.en.md">English</a>
+</h3>
+
 # ZWBTagContainerView
 
 一个轻量、灵活的 iOS 流式标签容器，支持**纯文字**、**纯图片**、**图文混合**三种 item 类型，自动换行，图片统一高度宽度自适应，三种水平对齐方式，适配 UITableViewCell / UICollectionViewCell 复用场景。
